@@ -1,189 +1,75 @@
-name: Build Ubuntu 26.04 Verilator offline bundle
+name: Build Yosys+OpenSTA offline bundle (Ubuntu 26.04)
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/build-offline-bundle.yml"
-
-permissions:
-  contents: read
 
 jobs:
   build-bundle:
-    # GitHub-hosted Linux x64 runner. No software is installed on your Windows PC.
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
 
     steps:
-      - name: Prepare bundle directories
-        shell: bash
-        run: |
-          mkdir -p bundle/debs bundle/src
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Download complete APT dependency set in a clean Ubuntu 26.04 container
-        shell: bash
+      # 在干净容器中下载 .deb，避免 Runner 预装软件导致漏包
+      - name: Download .deb dependencies in clean container
         run: |
-          set -euxo pipefail
-          docker pull ubuntu:26.04
           docker run --rm \
-            -v "$GITHUB_WORKSPACE/bundle/debs:/out" \
+            -v "$PWD/debs:/out" \
             ubuntu:26.04 \
-            bash -euxo pipefail -c '
-              export DEBIAN_FRONTEND=noninteractive
+            bash -c '
+              set -e
               apt-get update
-              apt-get install -y --download-only --no-install-recommends \
-                build-essential gcc g++ make binutils \
-                autoconf m4 flex bison \
-                git help2man perl python3 \
-                libfl-dev \
-                zlib1g-dev liblz4-dev \
-                ccache libgoogle-perftools-dev numactl
-              cp -v /var/cache/apt/archives/*.deb /out/
+              apt-get install -y --download-only \
+                build-essential clang lld bison flex swig \
+                libreadline-dev gawk tcl-dev libffi-dev tcl-tclreadline \
+                zlib1g-dev libeigen3-dev libboost-system-dev libboost-python-dev libboost-filesystem-dev \
+                git make graphviz xdot pkg-config python3
+              cp /var/cache/apt/archives/*.deb /out/
             '
 
-      - name: Fetch Verilator stable source
-        shell: bash
+      - name: Download Yosys source (with submodules)
         run: |
-          set -euxo pipefail
-          git clone --depth 1 --branch stable \
-            https://github.com/verilator/verilator.git bundle/src/verilator-work
-          git -C bundle/src/verilator-work rev-parse HEAD \
-            > bundle/verilator-source-commit.txt
-          git -C bundle/src/verilator-work archive \
-            --format=tar.gz \
-            --output="$GITHUB_WORKSPACE/bundle/src/verilator-stable.tar.gz" \
-            HEAD
-          rm -rf bundle/src/verilator-work
+          mkdir -p src
+          git clone --recursive --depth=1 https://github.com/YosysHQ/yosys.git src/yosys
+          cd src/yosys
+          git rev-parse HEAD > ../../yosys-commit.txt
 
-      - name: Create inventory, installer and checksums
-        shell: bash
+      - name: Download OpenSTA source
         run: |
-          set -euxo pipefail
+          git clone --depth=1 https://github.com/The-OpenROAD-Project/OpenSTA.git src/OpenSTA
+          cd src/OpenSTA
+          git rev-parse HEAD > ../../opensta-commit.txt
 
-          cat > bundle/package-list.txt <<'EOF'
-          build-essential
-          gcc
-          g++
-          make
-          binutils
-          autoconf
-          m4
-          flex
-          bison
-          git
-          help2man
-          perl
-          python3
-          libfl-dev
-          zlib1g-dev
-          liblz4-dev
-          ccache
-          libgoogle-perftools-dev
-          numactl
-          EOF
+      - name: Download CUDD 3.0.0 source
+        run: |
+          wget -O src/cudd-3.0.0.tar.gz \
+            https://raw.githubusercontent.com/davidkebo/cudd/main/cudd_versions/cudd-3.0.0.tar.gz
 
-          : > bundle/package-inventory.tsv
-          shopt -s nullglob
-          debs=(bundle/debs/*.deb)
-          if (( ${#debs[@]} == 0 )); then
-            echo "No .deb files were downloaded" >&2
-            exit 1
-          fi
-          for f in "${debs[@]}"; do
-            dpkg-deb -f "$f" Package Version Architecture |
-              paste - - - >> bundle/package-inventory.tsv
+      - name: Generate SHA256SUMS and package inventory
+        run: |
+          cd debs
+          sha256sum *.deb > ../SHA256SUMS
+          for f in *.deb; do
+            dpkg-deb -f "$f" Package Version Architecture >> ../package-inventory.tsv
           done
+          cd ..
+          ls debs/*.deb | xargs -n1 basename > package-list.txt
 
-          cat > bundle/install_deps.sh <<'INSTALLER'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          source /etc/os-release
-          if [[ "${VERSION_ID:-}" != "26.04" || "${VERSION_CODENAME:-}" != "resolute" ]]; then
-            echo "ERROR: target must be Ubuntu 26.04 (resolute)." >&2
-            exit 1
-          fi
-          if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
-            echo "ERROR: target architecture must be amd64." >&2
-            exit 1
-          fi
-          if [[ ! -s "$ROOT/SHA256SUMS" ]]; then
-            echo "ERROR: SHA256SUMS missing." >&2
-            exit 1
-          fi
-          echo "[1/2] Verify bundle checksums..."
-          (cd "$ROOT" && sha256sum -c SHA256SUMS)
-          echo "[2/2] Install local packages only..."
-          shopt -s nullglob
-          debs=("$ROOT"/debs/*.deb)
-          if (( ${#debs[@]} == 0 )); then
-            echo "ERROR: no .deb files found." >&2
-            exit 1
-          fi
-          if [[ "$EUID" -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
-          $SUDO apt-get --no-download --yes --no-install-recommends install "${debs[@]}"
-          for cmd in gcc g++ make autoconf flex bison perl python3 git; do
-            command -v "$cmd" >/dev/null 2>&1 || {
-              echo "ERROR: missing command: $cmd" >&2
-              exit 1
-            }
-          done
-          echo "Offline dependencies installed."
-          INSTALLER
-          chmod +x bundle/install_deps.sh
+      - name: Prepare bundle directory
+        run: |
+          mkdir -p bundle
+          cp -r debs bundle/
+          cp -r src bundle/
+          cp SHA256SUMS package-inventory.tsv package-list.txt yosys-commit.txt opensta-commit.txt bundle/
+          cp install_deps.sh bundle/
+          cp build-cudd.sh bundle/
+          cp build-yosys.sh bundle/
+          cp build-opensta.sh bundle/
 
-          cat > bundle/README.txt <<'README'
-          Verilator offline bundle for Ubuntu 26.04 amd64
-
-          Contents:
-            debs/                         downloaded .deb packages
-            src/verilator-stable.tar.gz   Verilator stable source snapshot
-            verilator-source-commit.txt   exact source commit
-            package-list.txt              requested top-level packages
-            package-inventory.tsv         package/version/architecture inventory
-            SHA256SUMS                    integrity checksums
-            install_deps.sh               offline installer
-
-          On the offline Ubuntu 26.04 amd64 target:
-            1. Extract the downloaded artifact.
-            2. cd into the extracted bundle directory.
-            3. chmod +x install_deps.sh
-            4. ./install_deps.sh
-
-          Build Verilator:
-            mkdir -p ~/src/verilator && cd ~/src/verilator
-            tar -xzf /path/to/bundle/src/verilator-stable.tar.gz
-            # Extract the source archive into this directory, then:
-            unset VERILATOR_ROOT
-            autoconf
-            ./configure
-            make -j"$(nproc)"
-            sudo make install
-            verilator --version
-
-          Notes:
-          - Built for Ubuntu 26.04 (resolute), amd64.
-          - APT downloads the dependency closure in a clean Ubuntu 26.04
-            container. Packages already included in the Ubuntu base image
-            are assumed to be part of the target OS base installation.
-          - The bundle includes optional ccache, gperftools and numactl
-            development/runtime packages as well as core build dependencies.
-          - No network access is needed by install_deps.sh.
-          README
-
-          (
-            cd bundle
-            find debs src -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-            sha256sum package-list.txt package-inventory.tsv install_deps.sh README.txt \
-              verilator-source-commit.txt >> SHA256SUMS
-          )
-
-      - name: Upload offline bundle
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: verilator-offline-ubuntu2604-amd64
+          name: yosys-opensta-offline-ubuntu2604-amd64
           path: bundle/
-          if-no-files-found: error
-          compression-level: 6
           retention-days: 30
